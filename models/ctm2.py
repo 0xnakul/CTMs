@@ -706,6 +706,7 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
             # done using only the currect activated state (see compute_synchronisation method for explanation)
 
             # update activated_state
+            activated_state = activated_state.clone()
             activated_state[torch.arange(B), active_groups_indices] = curr_activated_state
 
             # --- Calculate Synchronisation for Output Predictions ---
@@ -723,6 +724,10 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
 
 
             # TODO: updated alpha beta stores for action and out
+            decay_alpha_out_per_group = decay_alpha_out_per_group.clone()
+            decay_beta_out_per_group = decay_beta_out_per_group.clone()
+            decay_alpha_action_per_group = decay_alpha_action_per_group.clone()
+            decay_beta_action_per_group = decay_beta_action_per_group.clone()
             decay_alpha_out_per_group[torch.arange(B), active_groups_indices] = decay_alpha_out
             decay_beta_out_per_group[torch.arange(B), active_groups_indices] = decay_beta_out
             decay_alpha_action_per_group[torch.arange(B), active_groups_indices] = decay_alpha_action
