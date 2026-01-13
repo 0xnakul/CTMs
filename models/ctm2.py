@@ -625,6 +625,7 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
         synch_out_tracking = []
         synch_action_tracking = []
         attention_tracking = []
+        neuron_group_indices_tracking = []
 
         # --- Featurise Input Data ---
         kv = self.compute_features(x)
@@ -740,6 +741,7 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
                 attention_tracking.append(attn_weights.detach().cpu().numpy())
                 synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
                 synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
+                neuron_group_indices_tracking.append(active_groups_indices.detach().cpu().numpy())
 
         # --- Return Values ---
         if track:
