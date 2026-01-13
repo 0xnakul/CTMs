@@ -236,6 +236,40 @@ class SuperLinear(nn.Module):
         return out
 
 
+class Linear(nn.Module):
+    def __init__(self,
+                 in_dims,
+                 out_dims,
+                 N,
+                 T=1.0,
+                 do_norm=False,
+                 dropout=0):
+
+        super().__init__()
+        # N is the number of neurons (d_model), in_dims is the history length (memory_length)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else Identity()
+        self.in_dims = in_dims # Corresponds to memory_length
+        # LayerNorm applied across the history dimension for each neuron independently
+        self.layernorm = nn.LayerNorm(in_dims, elementwise_affine=True) if do_norm else Identity()
+        self.do_norm = do_norm
+
+        self.linear = nn.Linear(in_dims, out_dims)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor, expected shape (B, N, in_dims)
+                              where B=batch, N=d_model, in_dims=memory_length.
+        """
+        # Apply dropout
+        x = self.dropout(x)
+        # Apply LayerNorm if enabled
+        if self.do_norm:
+            x = self.layernorm(x)
+        # Apply linear transformation
+        x = self.linear(x)
+        return x
+
 # --- Backbone Modules ---
 
 class ParityBackbone(nn.Module):
