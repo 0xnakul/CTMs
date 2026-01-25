@@ -45,6 +45,8 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
         heads (int): Number of attention heads.
         n_neuron_groups (int): Number of groups of neurons, each with d_model dimensionality.
         group_router_type (str): Type of routing module to use for selecting group of active neurons. Supports 'linear' or 'MLP'
+        use_tick_conditioned_routing (bool): Whether to use tick-conditioned routing.
+        use_tick_training_curriculum (bool): Whether to use tick-conditioned routing curriculum during training. first 20% of ticks route randomly
         n_synch_out (int): Number of neurons used for output synchronisation (D_out, in paper).
         n_synch_action (int): Number of neurons used for action/attention synchronisation (D_action, in paper).
         synapse_depth (int): Depth of the synapse model (U-Net if > 1, else MLP).
@@ -89,6 +91,8 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
                  heads,
                  n_neuron_groups,
                  group_router_type,
+                 use_tick_conditioned_routing,
+                 use_tick_training_curriculum,
                  n_synch_out,
                  n_synch_action,
                  synapse_depth,
@@ -113,6 +117,7 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
         self.d_model = d_model
         self.d_input = d_input
         self.n_neuron_groups = n_neuron_groups
+        self.use_tick_conditioned_routing = use_tick_conditioned_routing
         self.memory_length = memory_length
         self.prediction_reshaper = prediction_reshaper
         self.n_synch_out = n_synch_out
@@ -124,6 +129,8 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
         self.memory_length = memory_length
         self.synapse_depth = synapse_depth
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
+
+        self.use_tick_training_curriculum = use_tick_training_curriculum
 
         # --- Assertions ---
         self.verify_args()
@@ -162,6 +169,8 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
         self.set_synchronisation_parameters('out', self.n_synch_out, n_random_pairing_self)
 
         # --- Group Router ---
+        if self.use_tick_conditioned_routing:
+            self.tick_embedding = nn.Embedding(self.iterations, self.synch_representation_size_out)
         self.neuron_group_router = self.get_neuron_group_router(group_router_type, self.synch_representation_size_out, self.n_neuron_groups, dropout_router)
 
         # --- Output Procesing ---
@@ -363,6 +372,8 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
             self.backbone = prepare_resnet_backbone(self.backbone_type)
         elif self.backbone_type == 'none':
             self.backbone = nn.Identity()
+        elif self.backbone_type == 'patchify':
+            self.backbone = nn.Conv2d(in_channels=3, out_channels=self.d_input, kernel_size=2)
         else:
             raise ValueError(f"Invalid backbone_type: {self.backbone_type}")
 
@@ -431,7 +442,7 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
                 )
             )
 
-    def get_neuron_group_router(self, group_router_type, d_model, n_neuron_groups, dropout_router):
+    def get_neuron_group_router(self, group_router_type, in_dim, n_neuron_groups, dropout_router):
         """
         The neuron group router is used to decide which group should process the input at the next internal tick.
         We use gumbel_softmax later in the forward pass to hard route to a group, using the logits obtained from this router
@@ -439,14 +450,15 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
         if group_router_type == 'linear':
             return nn.Sequential(
                 nn.Dropout(dropout_router),
-                nn.Linear(d_model, n_neuron_groups),
+                nn.Linear(in_dim, n_neuron_groups),
             )
         elif group_router_type == 'mlp':
             return nn.Sequential(
-                nn.Dropout(dropout_router),
-                nn.Linear(d_model, d_model),
+                nn.LayerNorm(in_dim),
+                nn.Linear(in_dim, in_dim),
                 nn.ReLU(),
-                nn.Linear(d_model, n_neuron_groups),
+                nn.Dropout(dropout_router),
+                nn.Linear(in_dim, n_neuron_groups),
             )
         else:
             raise ValueError(f"Unknown group router type: {group_router_type}")
@@ -696,9 +708,19 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
             # The 'state_trace' is the history of incoming pre-activations
             # the active_group_indices got updates, the remaining ones did not
             # start by creating an empty state trace update matrix for the every group
-            state_trace_update = self.inactive_pre_activation.unsqueeze(0).unsqueeze(0).expand(B, self.n_neuron_groups, self.d_model).clone()
-            state_trace_update[torch.arange(B), active_groups_indices] = state
-            state_trace = torch.cat((state_trace[:, :, :, 1:], state_trace_update.unsqueeze(-1)), dim=-1)
+
+            #NOTE: the code below appends a null state to the inactive groups, which is learnable. But the \alpha and \beta params for sync are not updated for inactive groups.
+            # But the history of pre-activations is still updated for inactive groups to a null state. Which can disturb later sync calculation which depends on linear relation, and alpha beta
+            # so, we freeze the state. If we replicate last state, it can create a vanishing grad problem
+            #
+            # state_trace_update = self.inactive_pre_activation.unsqueeze(0).unsqueeze(0).expand(B, self.n_neuron_groups, self.d_model).clone()
+            # state_trace_update[torch.arange(B), active_groups_indices] = state
+            # state_trace = torch.cat((state_trace[:, :, :, 1:], state_trace_update.unsqueeze(-1)), dim=-1)
+            #
+            # Updated code
+            state_trace = state_trace.clone()
+            state_trace[torch.arange(B), active_groups_indices, :, -1] = state
+
 
             # --- Apply Neuron-Level Models ---;;;;;
             curr_activated_state = self.process_trace(state_trace, active_groups_indices)
@@ -717,8 +739,22 @@ class ContinuousThoughtMachine2(nn.Module, PyTorchModelHubMixin):
             current_prediction = self.output_projector(synchronisation_out)
             current_certainty = self.compute_certainty(current_prediction)
 
-            curr_active_neuron_group_onehot = F.gumbel_softmax(self.neuron_group_router(synchronisation_out), dim=-1, hard=True)
+            if (not self.use_tick_training_curriculum) or stepi >= self.iterations // 3:
+                if self.use_tick_conditioned_routing:
+                    tick_cond = self.tick_embedding(torch.tensor(stepi, device=device)).unsqueeze(0).expand(B, -1)
+                    router_input = tick_cond + synchronisation_out
+                else:
+                    router_input = synchronisation_out
 
+            if not self.use_tick_training_curriculum:
+                curr_active_neuron_group_onehot = F.gumbel_softmax(self.neuron_group_router(router_input), dim=-1, hard=True)
+            else:
+                if stepi < self.iterations // 3:
+                    # select random neuron group for each sample
+                    random_indices = torch.randint(0, self.n_neuron_groups, (B,), device=device)
+                    curr_active_neuron_group_onehot = F.one_hot(random_indices, num_classes=self.n_neuron_groups).float()
+                else:
+                    curr_active_neuron_group_onehot = F.gumbel_softmax(self.neuron_group_router(router_input), dim=-1, hard=True)
 
             predictions[..., stepi] = current_prediction
             certainties[..., stepi] = current_certainty
